@@ -1,0 +1,9 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "knowledgemcp-stack"
+resolve_s3 = true
+s3_prefix = "knowledgemcp"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"

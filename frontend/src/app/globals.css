@@ -1,0 +1,139 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+	--bg: #f4f6ef;
+	--surface: #ffffff;
+	--surface-soft: #edf2e1;
+	--text: #152014;
+	--muted: #4b5d48;
+	--border: #cedac8;
+	--primary: #136f63;
+	--primary-strong: #0b4e46;
+	--accent: #da6a32;
+	--focus: #0f766e;
+}
+
+html.dark {
+	--bg: #0f1a14;
+	--surface: #162019;
+	--surface-soft: #1b2b21;
+	--text: #e0ead8;
+	--muted: #93a98e;
+	--border: #2c3e2e;
+	--primary: #1fa191;
+	--primary-strong: #26bfad;
+	--accent: #e88a56;
+	--focus: #1fa191;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+	margin: 0;
+	padding: 0;
+}
+
+body {
+	min-height: 100vh;
+	color: var(--text);
+	background: var(--bg);
+}
+
+html:not(.dark) body {
+	background:
+		radial-gradient(circle at 10% 5%, rgba(218, 106, 50, 0.14), transparent 28%),
+		radial-gradient(circle at 88% 8%, rgba(19, 111, 99, 0.16), transparent 24%),
+		linear-gradient(180deg, #f6f8f1 0%, #eff4e7 38%, #f8faf5 100%);
+}
+
+html.dark body {
+	background:
+		radial-gradient(circle at 10% 5%, rgba(218, 106, 50, 0.06), transparent 28%),
+		radial-gradient(circle at 88% 8%, rgba(19, 111, 99, 0.08), transparent 24%),
+		var(--bg);
+}
+
+.container { @apply max-w-7xl mx-auto px-4 sm:px-6 lg:px-8; }
+
+.btn-primary {
+	@apply inline-flex items-center justify-center px-6 py-3 rounded-xl font-semibold transition;
+	background: linear-gradient(140deg, var(--primary) 0%, #149d8f 100%);
+	color: #ffffff;
+	box-shadow: 0 10px 24px rgba(19, 111, 99, 0.24);
+}
+
+.btn-primary:hover {
+	transform: translateY(-1px);
+	box-shadow: 0 14px 30px rgba(19, 111, 99, 0.3);
+}
+
+.btn-secondary {
+	@apply inline-flex items-center justify-center px-6 py-3 rounded-xl font-semibold transition;
+	background: #ffffff;
+	color: var(--primary-strong);
+	border: 1px solid rgba(19, 111, 99, 0.3);
+}
+
+.btn-secondary:hover {
+	background: #ecf8f6;
+}
+
+.card {
+	@apply rounded-2xl border;
+	border-color: var(--border);
+	background: var(--surface);
+	box-shadow: 0 10px 28px rgba(21, 32, 20, 0.08);
+	backdrop-filter: blur(3px);
+}
+
+input, textarea, select {
+	color: var(--text);
+	border-color: var(--border);
+	background: var(--surface);
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+button:focus-visible,
+a:focus-visible {
+	outline: 3px solid rgba(15, 118, 110, 0.45);
+	outline-offset: 2px;
+}
+
+.page-enter {
+	animation: rise-in 420ms ease-out both;
+}
+
+.stagger > * {
+	animation: rise-in 500ms ease-out both;
+}
+
+.stagger > *:nth-child(2) { animation-delay: 60ms; }
+.stagger > *:nth-child(3) { animation-delay: 110ms; }
+.stagger > *:nth-child(4) { animation-delay: 150ms; }
+
+@keyframes rise-in {
+	from {
+		opacity: 0;
+		transform: translateY(10px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.page-enter,
+	.stagger > * {
+		animation: none;
+	}
+
+	.btn-primary,
+	.btn-secondary {
+		transition: none;
+	}
+}

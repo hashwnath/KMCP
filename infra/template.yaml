@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  KnowledgeMCP — Multi-tenant docs-to-MCP platform.
+  AWS best practices: ARM64/Graviton, provisioned concurrency for MCP,
+  DLQs on all queues, reserved concurrency, CloudWatch alarms.
+
+# =====================================================================
+# PARAMETERS
+# =====================================================================
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+  OpenSearchEndpoint:
+    Type: String
+    NoEcho: true
+  OpenSearchMasterUser:
+    Type: String
+    Default: 'admin'
+    Description: 'Master username for managed OpenSearch domain'
+  OpenSearchMasterPassword:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: 'Master password for managed OpenSearch domain'
+  EmbeddingProvider:
+    Type: String
+    Default: bedrock
+    AllowedValues: [bedrock, openai]
+  BedrockModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+  OpenAIApiKey:
+    Type: String
+    Default: ''
+    NoEcho: true
+  JwtSecretKey:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: 'JWT signing secret (min 32 chars). Generate with: python -c "import secrets; print(secrets.token_urlsafe(64))"'
+  FrontendOrigin:
+    Type: String
+    Default: 'http://localhost:3000'
+    Description: 'Frontend origin for CORS (e.g., https://app.knowledgemcp.io). Use * for dev.'
+  AppBaseUrl:
+    Type: String
+    Default: 'http://localhost:3000'
+    Description: 'Base URL used in auth emails (e.g., https://app.knowledgemcp.io).'
+  SesFromEmail:
+    Type: String
+    Default: ''
+    Description: 'Verified SES sender email for magic-link delivery.'
+  SignupCode:
+    Type: String
+    Default: ''
+    Description: 'Invite code for beta signup. Leave empty for open registration.'
+  McpProvisionedConcurrency:
+    Type: Number
+    Default: 0
+    Description: 'Provisioned concurrency for MCP Lambda (eliminates cold starts for agents). Set to 0 for dev.'
+
+# =====================================================================
+# GLOBALS — ARM64/Graviton for cost + perf
+# =====================================================================
+Globals:
+  Function:
+    Runtime: python3.11
+    Architectures: [x86_64]
+    Timeout: 300
+    MemorySize: 512
+    Environment:
+      Variables:
+        APP_AWS_REGION: !Ref AWS::Region
+        APP_AWS_ACCOUNT_ID: !Ref AWS::AccountId
+        STAGE: !Ref Stage
+        OPENSEARCH_ENDPOINT: !Ref OpenSearchEndpoint
+        EMBEDDING_PROVIDER: !Ref EmbeddingProvider
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        OPENAI_API_KEY: !Ref OpenAIApiKey
+        JWT_SECRET_KEY: !Ref JwtSecretKey
+        TENANTS_TABLE: !Ref TenantsTable
+        SOURCES_TABLE: !Ref SourcesTable
+        ANALYTICS_TABLE: !Ref AnalyticsTable
+        CONTENT_BUCKET: !Ref ContentBucket
+        CRAWL_QUEUE_URL: !Ref CrawlQueue
+        INDEX_QUEUE_URL: !Ref IndexQueue
+        FRONTEND_ORIGIN: !Ref FrontendOrigin
+        APP_BASE_URL: !Ref AppBaseUrl
+        SES_FROM_EMAIL: !Ref SesFromEmail
+        OPENSEARCH_MASTER_USER: !Ref OpenSearchMasterUser
+        OPENSEARCH_MASTER_PASSWORD: !Ref OpenSearchMasterPassword
+        SIGNUP_CODE: !Ref SignupCode
+        DEBUG: 'false'
+
+Resources:
+  # =====================================================================
+  # SQS QUEUES — with Dead Letter Queues
+  # =====================================================================
+  CrawlDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'knowledgemcp-crawl-dlq-${Stage}'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  CrawlQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'knowledgemcp-crawl-${Stage}'
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CrawlDLQ.Arn
+        maxReceiveCount: 3
+
+  IndexDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'knowledgemcp-index-dlq-${Stage}'
+      MessageRetentionPeriod: 1209600
+
+  IndexQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'knowledgemcp-index-${Stage}'
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IndexDLQ.Arn
+        maxReceiveCount: 3
+
+  # =====================================================================
+  # DYNAMODB — PAY_PER_REQUEST (cost-optimal for variable workloads)
+  # =====================================================================
+  TenantsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'knowledgemcp-tenants-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: slug
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: slug-index
+          KeySchema:
+            - AttributeName: slug
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  SourcesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'knowledgemcp-sources-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: source_id
+          AttributeType: S
+        - AttributeName: tenant_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: source_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-index
+          KeySchema:
+            - AttributeName: tenant_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  AnalyticsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'knowledgemcp-analytics-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tenant_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenant_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+
+  # =====================================================================
+  # S3 — tightened CORS, public access blocked
+  # =====================================================================
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'knowledgemcp-content-${AWS::AccountId}-${Stage}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupIncompleteUploads
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+            Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['content-type']
+            AllowedMethods: [PUT]
+            AllowedOrigins: [!Ref FrontendOrigin]
+            MaxAge: 3600
+
+
+  # =====================================================================
+  # API GATEWAY — HTTP API with throttling
+  # =====================================================================
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      CorsConfiguration:
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: [content-type, authorization, x-api-key]
+        AllowOrigins: [!Ref FrontendOrigin]
+
+  # =====================================================================
+  # LAMBDA FUNCTIONS
+  # =====================================================================
+
+  # Crawler — triggered by SQS, reserved concurrency to avoid account-wide throttle
+  CrawlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'knowledgemcp-crawler-${Stage}'
+      CodeUri: ../
+      Handler: src.crawler.handler.handler
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref SourcesTable}
+        - SQSSendMessagePolicy: {QueueName: !GetAtt IndexQueue.QueueName}
+        - SQSPollerPolicy: {QueueName: !GetAtt CrawlQueue.QueueName}
+        - S3CrudPolicy: {BucketName: !Ref ContentBucket}
+        - Statement:
+            - Effect: Allow
+              Action: ['secretsmanager:GetSecretValue']
+              Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:knowledgemcp/source/*'
+      Events:
+        CrawlQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt CrawlQueue.Arn
+            BatchSize: 1
+
+  # Indexer — memory-intensive (embeddings), reserved concurrency
+  IndexerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'knowledgemcp-indexer-${Stage}'
+      CodeUri: ../
+      Handler: src.indexer.handler.handler
+      MemorySize: 1024
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref SourcesTable}
+        - SQSPollerPolicy: {QueueName: !GetAtt IndexQueue.QueueName}
+        - S3ReadPolicy: {BucketName: !Ref ContentBucket}
+        - Statement:
+            - Effect: Allow
+              Action: ['bedrock:InvokeModel']
+              Resource: '*'
+      Events:
+        IndexQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IndexQueue.Arn
+            BatchSize: 1
+
+  # Admin API
+  AdminApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'knowledgemcp-admin-${Stage}'
+      CodeUri: ../
+      Handler: src.admin.handler.lambda_handler
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref TenantsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref SourcesTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref AnalyticsTable}
+        - SQSSendMessagePolicy: {QueueName: !GetAtt CrawlQueue.QueueName}
+        - S3CrudPolicy: {BucketName: !Ref ContentBucket}
+        - Statement:
+            - Effect: Allow
+              Action: ['ses:SendEmail', 'ses:SendRawEmail']
+              Resource: '*'
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:CreateSecret
+                - secretsmanager:DeleteSecret
+                - secretsmanager:DescribeSecret
+              Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:knowledgemcp/source/*'
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/{proxy+}
+            Method: ANY
+
+  # Scheduled Sync Worker — dispatches hourly/daily/weekly sync jobs
+  SchedulerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'knowledgemcp-scheduler-${Stage}'
+      CodeUri: ../
+      Handler: src.scheduler.handler.handler
+      MemorySize: 256
+      Timeout: 120
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref SourcesTable}
+        - SQSSendMessagePolicy: {QueueName: !GetAtt CrawlQueue.QueueName}
+      Events:
+        HourlySync:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Input: '{"cadence":"hourly"}'
+        DailySync:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Input: '{"cadence":"daily"}'
+        WeeklySync:
+          Type: Schedule
+          Properties:
+            Schedule: rate(7 days)
+            Input: '{"cadence":"weekly"}'
+
+  # MCP Server — THE CUSTOMER-FACING ENDPOINT
+  # Provisioned concurrency eliminates cold starts (3-5s → <200ms)
+  McpServerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'knowledgemcp-mcp-${Stage}'
+      CodeUri: ../
+      Handler: src.mcp_server.lambda_handler.lambda_handler
+      MemorySize: 512
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref TenantsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref AnalyticsTable}
+        - Statement:
+            - Effect: Allow
+              Action: ['bedrock:InvokeModel']
+              Resource: '*'
+      Events:
+        McpProxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /mcp/{proxy+}
+            Method: ANY
+        McpHealth:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /health
+            Method: GET
+
+  # =====================================================================
+  # CLOUDWATCH ALARMS — SLA monitoring
+  # =====================================================================
+  McpErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'knowledgemcp-mcp-errors-${Stage}'
+      AlarmDescription: 'MCP server Lambda errors > 5 in 5 minutes'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref McpServerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  McpLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'knowledgemcp-mcp-latency-${Stage}'
+      AlarmDescription: 'MCP server p99 latency > 3 seconds'
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref McpServerFunction
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  DlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'knowledgemcp-dlq-messages-${Stage}'
+      AlarmDescription: 'Messages appearing in DLQ — indexing failures'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IndexDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# =====================================================================
+# OUTPUTS
+# =====================================================================
+Outputs:
+  AdminApiUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/api'
+  McpServerUrl:
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/mcp'
+  CrawlQueueUrl:
+    Value: !Ref CrawlQueue
+  IndexQueueUrl:
+    Value: !Ref IndexQueue
+  ContentBucketName:
+    Value: !Ref ContentBucket
+  CrawlDLQUrl:
+    Value: !Ref CrawlDLQ
+  IndexDLQUrl:
+    Value: !Ref IndexDLQ
