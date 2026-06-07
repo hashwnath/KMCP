@@ -1,16 +1,15 @@
 """Scheduled sync dispatcher.
 
-Triggered by EventBridge on hourly/daily/weekly cadences.
-Finds sources matching cadence and enqueues crawl jobs.
+In AWS this is triggered by EventBridge on hourly/daily/weekly cadences.
+In local mode it can be invoked by an external scheduler (cron or a one-shot
+manual call from the worker container).
 """
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
-from src.common.aws_clients import get_dynamodb_resource, get_sqs_client
-from src.common.config import get_config
+from src.common.backends.factory import get_queue, get_source_repo
 from src.common.source_secrets import migrate_source_item_if_needed
 
 
@@ -21,35 +20,17 @@ def _extract_cadence(event: dict) -> str:
     return cadence
 
 
-def _iter_sources_for_cadence(cadence: str):
-    config = get_config()
-    table = get_dynamodb_resource().Table(config.sources_table)
-
-    scan_kwargs = {
-        "FilterExpression": "sync_schedule = :sc",
-        "ExpressionAttributeValues": {":sc": cadence},
-    }
-    response = table.scan(**scan_kwargs)
-    for item in response.get("Items", []):
-        yield item
-
-    while "LastEvaluatedKey" in response:
-        response = table.scan(ExclusiveStartKey=response["LastEvaluatedKey"], **scan_kwargs)
-        for item in response.get("Items", []):
-            yield item
-
-
 def handler(event: dict, context: object) -> dict:
     cadence = _extract_cadence(event)
-    config = get_config()
-    sqs = get_sqs_client()
-    table = get_dynamodb_resource().Table(config.sources_table)
+    source_repo = get_source_repo()
+    queue = get_queue()
 
     now = datetime.now(timezone.utc).isoformat()
     enqueued = 0
 
-    for source in _iter_sources_for_cadence(cadence):
-        source = migrate_source_item_if_needed(table, source)
+    for source in source_repo.list_by_schedule(cadence):
+        # Pass None: secret migration uses the SourceRepository path now.
+        source = migrate_source_item_if_needed(None, source)
         status = source.get("status", "")
         if status in {"crawling", "indexing", "reindexing"}:
             continue
@@ -62,27 +43,23 @@ def handler(event: dict, context: object) -> dict:
         if not (source_id and tenant_id and source_type):
             continue
 
-        sqs.send_message(
-            QueueUrl=config.crawl_queue_url,
-            MessageBody=json.dumps(
-                {
-                    "tenant_id": tenant_id,
-                    "source_id": source_id,
-                    "source_type": source_type,
-                    "config": source_config,
-                    "action": "scheduled_sync",
-                    "schedule": cadence,
-                }
-            ),
+        queue.send(
+            "crawl",
+            {
+                "tenant_id": tenant_id,
+                "source_id": source_id,
+                "source_type": source_type,
+                "config": source_config,
+                "action": "scheduled_sync",
+                "schedule": cadence,
+            },
         )
-        table.update_item(
-            Key={"source_id": source_id},
-            UpdateExpression="SET #s = :s, last_scheduled_at = :ls, updated_at = :u",
-            ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":s": "pending",
-                ":ls": now,
-                ":u": now,
+        source_repo.update(
+            source_id,
+            {
+                "status": "pending",
+                "last_scheduled_at": now,
+                "updated_at": now,
             },
         )
         enqueued += 1

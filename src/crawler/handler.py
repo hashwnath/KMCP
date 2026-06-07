@@ -1,18 +1,26 @@
-"""Lambda handler that routes crawl jobs by source type."""
+"""Crawler handler.
+
+In AWS this is a Lambda triggered by SQS. In local mode it's called by the
+worker thread per pending crawl job. All AWS services go through the
+backend factory.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-import hashlib
-from typing import Any
 from datetime import datetime, timezone
+from typing import Any
 
-import boto3
-
-from src.common.aws_clients import get_dynamodb_resource, get_secretsmanager_client
+from src.common.backends.factory import (
+    get_queue,
+    get_source_repo,
+    get_storage,
+)
 from src.common.config import get_config
 from src.common.models import CrawlJob, Document, SourceType
+from src.common.source_secrets import fetch_source_secret
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -23,58 +31,34 @@ def _hash_text(value: str) -> str:
 
 
 def _send_to_index_queue(documents: list[Document]) -> None:
-    """Send processed documents to the INDEX_QUEUE for indexing."""
-    config = get_config()
-    if not config.index_queue_url:
-        logger.error("INDEX_QUEUE_URL is not configured")
-        return
-
-    sqs = boto3.client("sqs", region_name=config.aws_region)
+    queue = get_queue()
     for doc in documents:
-        sqs.send_message(
-            QueueUrl=config.index_queue_url,
-            MessageBody=doc.model_dump_json(),
-            MessageAttributes={
-                "tenant_id": {"StringValue": doc.tenant_id, "DataType": "String"},
-                "source_id": {"StringValue": doc.source_id, "DataType": "String"},
-            },
-        )
+        queue.send("index", json.loads(doc.model_dump_json()))
     logger.info("Sent %d documents to index queue", len(documents))
 
 
 def _resolve_source_config(config: dict) -> dict:
-    """Expand `secret_ref` credentials from Secrets Manager into config."""
+    """Expand `secret_ref` credentials from the SecretStore into config."""
     resolved = dict(config or {})
     secret_ref = resolved.get("secret_ref")
     if not secret_ref:
         return resolved
-
-    sm = get_secretsmanager_client()
-    payload = sm.get_secret_value(SecretId=secret_ref).get("SecretString", "{}")
-    secret_values = json.loads(payload)
+    secret_values = fetch_source_secret(secret_ref)
     if isinstance(secret_values, dict):
         resolved.update(secret_values)
     return resolved
 
 
-def _update_source_crawl_progress(source_id: str, *, status: str, pages_found: int | None = None) -> None:
-    """Persist crawl-stage progress fields on source record."""
-    table = get_dynamodb_resource().Table(get_config().sources_table)
-    expr = ["#s = :s", "updated_at = :u"]
-    values: dict[str, Any] = {
-        ":s": status,
-        ":u": datetime.now(timezone.utc).isoformat(),
+def _update_source_crawl_progress(
+    source_id: str, *, status: str, pages_found: int | None = None
+) -> None:
+    updates: dict[str, Any] = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if pages_found is not None:
-        expr.append("pages_found = :pf")
-        values[":pf"] = pages_found
-
-    table.update_item(
-        Key={"source_id": source_id},
-        UpdateExpression="SET " + ", ".join(expr),
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues=values,
-    )
+        updates["pages_found"] = pages_found
+    get_source_repo().update(source_id, updates)
 
 
 async def _dispatch_crawl(job: CrawlJob) -> list[Document]:
@@ -91,13 +75,16 @@ async def _dispatch_crawl(job: CrawlJob) -> list[Document]:
         return []
 
     if job.source_type == SourceType.WEBSITE_URL:
-        from src.crawler.sitemap_parser import parse_sitemap
-        from src.crawler.page_fetcher import fetch_pages_batch
+        from src.crawler.code_extractor import extract_code_blocks
         from src.crawler.html_to_markdown import html_to_markdown
         from src.crawler.metadata_extractor import extract_metadata
-        from src.crawler.code_extractor import extract_code_blocks
+        from src.crawler.page_fetcher import fetch_pages_batch
+        from src.crawler.sitemap_parser import parse_sitemap
 
-        sitemap_url = cfg.get("sitemap_url") or cfg.get("url", "").rstrip("/") + "/sitemap.xml"
+        sitemap_url = (
+            cfg.get("sitemap_url")
+            or cfg.get("url", "").rstrip("/") + "/sitemap.xml"
+        )
         urls = await parse_sitemap(sitemap_url)
         logger.info("Parsed %d URLs from sitemap %s", len(urls), sitemap_url)
 
@@ -189,13 +176,13 @@ async def _dispatch_crawl(job: CrawlJob) -> list[Document]:
     if job.source_type == SourceType.FILE_UPLOAD:
         from src.crawler.file_processor import process_file
 
-        s3 = boto3.client("s3", region_name=get_config().aws_region)
-        bucket = cfg["bucket"]
+        # Pull the uploaded file from the ObjectStorage backend.
+        # Key was generated by upload_presign as uploads/{tenant}/{uuid}/{filename}.
         key = cfg["key"]
-        resp = s3.get_object(Bucket=bucket, Key=key)
-        file_bytes = resp["Body"].read()
+        file_bytes = get_storage().get(key)
         filename = key.rsplit("/", 1)[-1]
         md, meta = process_file(file_bytes, filename)
+        bucket = cfg.get("bucket") or get_config().content_bucket
         return [
             Document(
                 doc_id=_hash_text(f"{tenant_id}:{source_id}:{key}"),
@@ -224,32 +211,41 @@ async def _dispatch_crawl(job: CrawlJob) -> list[Document]:
     raise ValueError(f"Unsupported source type: {job.source_type}")
 
 
-def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
-    """AWS Lambda handler triggered by SQS crawl queue."""
+def process_crawl_job(body: dict) -> dict[str, Any]:
+    """Public, backend-agnostic entrypoint used by the local worker."""
     import asyncio
 
+    job = CrawlJob(**body)
+    if job.action != "delete":
+        _update_source_crawl_progress(job.source_id, status="crawling")
+    loop = asyncio.new_event_loop()
+    try:
+        documents = loop.run_until_complete(_dispatch_crawl(job))
+    finally:
+        loop.close()
+    if job.action != "delete":
+        _update_source_crawl_progress(
+            job.source_id, status="indexing", pages_found=len(documents)
+        )
+    _send_to_index_queue(documents)
+    return {"processed": len(documents), "source_id": job.source_id}
+
+
+def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """AWS Lambda handler triggered by SQS crawl queue."""
     processed = 0
     errors = 0
 
     for record in event.get("Records", []):
         try:
             body = json.loads(record["body"])
-            job = CrawlJob(**body)
+            result = process_crawl_job(body)
+            processed += result["processed"]
             logger.info(
-                "Processing crawl job source_id=%s type=%s",
-                job.source_id,
-                job.source_type,
+                "Crawled %d documents for source_id=%s",
+                result["processed"],
+                result["source_id"],
             )
-            if job.action != "delete":
-                _update_source_crawl_progress(job.source_id, status="crawling")
-            documents = asyncio.get_event_loop().run_until_complete(
-                _dispatch_crawl(job)
-            )
-            if job.action != "delete":
-                _update_source_crawl_progress(job.source_id, status="indexing", pages_found=len(documents))
-            _send_to_index_queue(documents)
-            processed += len(documents)
-            logger.info("Crawled %d documents for source_id=%s", len(documents), job.source_id)
         except Exception:
             errors += 1
             logger.exception("Failed to process crawl record")

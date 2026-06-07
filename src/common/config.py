@@ -12,6 +12,12 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     """Application settings loaded from environment variables with sensible defaults."""
 
+    # Backend selector: "local" (default, zero AWS) or "aws"
+    backend: Literal["local", "aws"] = Field(default="local", alias="BACKEND")
+    local_data_dir: str = Field(default="./data", alias="LOCAL_DATA_DIR")
+    # Dev convenience: bypass magic-link delivery in local mode
+    dev_auth_allow: bool = Field(default=False, alias="DEV_AUTH_ALLOW")
+
     # AWS — Lambda reserves AWS_REGION, so we accept APP_AWS_REGION too
     aws_region: str = Field(
         default="us-east-1",
@@ -29,8 +35,11 @@ class Settings(BaseSettings):
     )
 
     # Embedding
-    embedding_provider: Literal["bedrock", "openai"] = Field(
-        default="bedrock", alias="EMBEDDING_PROVIDER"
+    embedding_provider: Literal["bedrock", "openai", "local"] = Field(
+        default="local", alias="EMBEDDING_PROVIDER"
+    )
+    local_embedding_model: str = Field(
+        default="BAAI/bge-small-en-v1.5", alias="LOCAL_EMBEDDING_MODEL"
     )
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     bedrock_model_id: str = Field(
