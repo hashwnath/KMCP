@@ -107,6 +107,27 @@ jobs:
           OPENSEARCH_ENDPOINT: http://localhost:9200
         run: python -m pytest tests/ -v --tb=short -k "test_local_e2e or test_local_backends"
 
+  sam-validate:
+    name: sam validate (AWS template stays green)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - name: sam validate --lint
+        run: |
+          cd infra
+          sam validate --lint
+
+  docker-build:
+    name: docker compose build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build all images
+        run: docker compose build
+
   gitleaks:
     name: gitleaks (no secrets in tree)
     runs-on: ubuntu-latest
