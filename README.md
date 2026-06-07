@@ -11,12 +11,14 @@
 </div>
 
 <div align="center">
-
-[![Watch the demo](docs/assets/demo-thumbnail.png)](https://github.com/hashwnath/KMCP/releases/download/v0.1.0/knowledgemcp-86s-1080p.mp4)
-
-*Click to watch the 86-second demo*
-
+  <a href="https://github.com/hashwnath/KMCP/releases/download/v0.1.0/knowledgemcp-86s-1080p.mp4">
+    <img src="docs/assets/demo-thumbnail.png" alt="Watch the demo" width="640">
+  </a>
+  <br>
+  <sub>Click to watch the 86-second demo</sub>
 </div>
+
+---
 
 KnowledgeMCP turns any documentation source (websites, PDFs, Confluence, Notion, S3, GitHub) into a **standards-compliant Model Context Protocol (MCP) endpoint**. Claude, GitHub Copilot, Cursor, and any other MCP-compatible agent can search and read those docs instantly — **with no LLM calls at query time** (we use a tiny local embedding model + hybrid BM25/kNN search in OpenSearch).
 
@@ -138,6 +140,21 @@ make up          # docker compose up -d --build
 - **Frontend** (`frontend/`) — [MIT](frontend/LICENSE)
 
 The AGPL-3.0 license means hosted/SaaS use must publish modifications under the same license. If that's a problem for your use case, please [open an issue](https://github.com/hashwnath/KMCP/issues) so we can discuss commercial licensing.
+
+## Why KnowledgeMCP?
+
+| | KnowledgeMCP | Typical RAG tools |
+|---|---|---|
+| **Query cost** | $0 (local embeddings + OpenSearch) | $0.01-0.10/query (LLM reranking) |
+| **Agent integration** | Native MCP — plug and play | REST API + custom glue code |
+| **Self-hosted** | `docker compose up`, no cloud account | Usually needs cloud APIs |
+| **Multi-tenant** | Per-tenant isolation built-in | Single-tenant, bolt-on later |
+| **Latency** | ~100ms (no LLM in path) | 1-5s (LLM reranking) |
+
+## Community
+
+- [GitHub Discussions](https://github.com/hashwnath/KMCP/discussions) — questions, ideas, show-and-tell
+- [Issues](https://github.com/hashwnath/KMCP/issues) — bug reports, feature requests
 
 ## Acknowledgements
 
