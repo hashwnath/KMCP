@@ -10,6 +10,14 @@
 
 </div>
 
+<div align="center">
+
+[![Watch the demo](docs/assets/demo-thumbnail.png)](https://github.com/hashwnath/KMCP/releases/download/v0.1.0/knowledgemcp-86s-1080p.mp4)
+
+*Click to watch the 86-second demo*
+
+</div>
+
 KnowledgeMCP turns any documentation source (websites, PDFs, Confluence, Notion, S3, GitHub) into a **standards-compliant Model Context Protocol (MCP) endpoint**. Claude, GitHub Copilot, Cursor, and any other MCP-compatible agent can search and read those docs instantly — **with no LLM calls at query time** (we use a tiny local embedding model + hybrid BM25/kNN search in OpenSearch).
 
 - 🔌 **MCP-native** — three tools (`docs_search`, `code_sample_search`, `docs_fetch`) any agent can plug into
