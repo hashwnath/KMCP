@@ -66,16 +66,26 @@ def get_bedrock_client() -> BedrockRuntimeClient:
 def get_opensearch_client() -> OpenSearch:
     """Return a cached OpenSearch client.
 
-    Supports two modes:
-    - Managed OpenSearch with internal user database (basic auth via
-      OPENSEARCH_MASTER_USER / OPENSEARCH_MASTER_PASSWORD env vars)
-    - OpenSearch Serverless (AOSS) with IAM4Auth
-
-    The mode is auto-detected from the presence of OPENSEARCH_MASTER_USER.
+    Modes (auto-detected):
+      - BACKEND=local + http:// endpoint -> no auth, no TLS (docker compose)
+      - OPENSEARCH_MASTER_USER set       -> managed OpenSearch with basic auth
+      - otherwise                        -> AOSS serverless with SigV4 IAM auth
     """
     import os
 
     cfg = get_config()
+    if cfg.backend == "local" and cfg.opensearch_endpoint.startswith("http://"):
+        from urllib.parse import urlparse
+        parsed = urlparse(cfg.opensearch_endpoint)
+        host = parsed.hostname or "opensearch"
+        port = parsed.port or 9200
+        return OpenSearch(
+            hosts=[{"host": host, "port": port}],
+            use_ssl=False,
+            verify_certs=False,
+            connection_class=RequestsHttpConnection,
+        )
+
     master_user = os.environ.get("OPENSEARCH_MASTER_USER", "")
     master_pass = os.environ.get("OPENSEARCH_MASTER_PASSWORD", "")
 
