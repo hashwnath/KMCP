@@ -47,7 +47,7 @@ When running with `BACKEND=aws` (see `docs/AWS_DEPLOYMENT.md`):
 ## Pre-existing leak disclosure (March 2026, pre-OSS scrub)
 
 A pre-OSS audit found 7 secret leaks in commit history on the now-deleted
-orphan branch `claude/deploy-knowledgemcp-aws-S6pu5`. Those commits referenced
+orphan branch `(removed orphan branch)`. Those commits referenced
 files (`HANDOFF.md`, `HANDOFF_NEXT.md`) that were never on `main`. The branch
 has been deleted from origin and the leaked credentials have been (or are
 being) rotated by the project owner. Anyone who cloned the orphan branch
