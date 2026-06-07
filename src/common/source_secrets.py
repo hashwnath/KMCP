@@ -1,11 +1,15 @@
-"""Utilities for handling source credentials without storing inline secrets."""
+"""Utilities for handling source credentials via the SecretStore backend.
+
+This module never talks to AWS directly anymore. Storage is delegated to
+src.common.backends.factory.get_secret_store(), which dispatches to either
+AWS Secrets Manager or a local SQLite-backed store depending on BACKEND.
+"""
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
-from src.common.aws_clients import get_secretsmanager_client
+from src.common.backends.factory import get_secret_store
 
 
 SENSITIVE_CONFIG_KEYS = {
@@ -53,44 +57,38 @@ def persist_source_secret(
     sensitive_config: dict,
     existing_secret_ref: str | None = None,
 ) -> str:
-    """Store or update sensitive source credentials in Secrets Manager."""
-    sm = get_secretsmanager_client()
+    """Store or update sensitive source credentials. Returns canonical ref/ARN."""
     secret_id = existing_secret_ref or f"knowledgemcp/source/{tenant_id}/{source_id}"
-    payload = json.dumps(sensitive_config)
+    return get_secret_store().put(secret_id, sensitive_config)
 
+
+def fetch_source_secret(secret_ref: str) -> dict:
+    """Read a previously-persisted source secret. Returns empty dict on error."""
+    if not secret_ref:
+        return {}
     try:
-        response = sm.create_secret(
-            Name=secret_id,
-            SecretString=payload,
-            Description="KnowledgeMCP source credentials",
-            Tags=[
-                {"Key": "app", "Value": "knowledgemcp"},
-                {"Key": "tenant_id", "Value": tenant_id},
-                {"Key": "source_id", "Value": source_id},
-            ],
-        )
-        return response.get("ARN", secret_id)
-    except Exception as exc:  # pragma: no cover - boto3 errors are runtime-specific
-        code = getattr(exc, "response", {}).get("Error", {}).get("Code")
-        if code != "ResourceExistsException":
-            raise
-
-    response = sm.put_secret_value(SecretId=secret_id, SecretString=payload)
-    return response.get("ARN", secret_id)
+        return get_secret_store().get(secret_ref)
+    except Exception:
+        return {}
 
 
 def delete_source_secret(secret_ref: str) -> None:
-    """Delete source secret from Secrets Manager (best-effort)."""
+    """Delete source secret (best-effort)."""
     try:
-        sm = get_secretsmanager_client()
-        sm.delete_secret(SecretId=secret_ref, ForceDeleteWithoutRecovery=True)
+        get_secret_store().delete(secret_ref)
     except Exception:
         # Keep source deletion idempotent even if secret cleanup fails.
         pass
 
 
 def migrate_source_item_if_needed(table: object, item: dict) -> dict:
-    """Move inline sensitive fields to Secrets Manager and persist redacted config."""
+    """Move inline sensitive fields to the SecretStore and persist redacted config.
+
+    `table` is accepted for backwards compatibility with the previous API.
+    When provided AND it exposes ``update_item`` (i.e., still a DynamoDB Table),
+    we call it directly to preserve existing test expectations. Otherwise we
+    fall back to the SourceRepository.
+    """
     config = item.get("config", {})
     public_config, sensitive_config = split_sensitive_config(config)
     if not sensitive_config:
@@ -108,13 +106,20 @@ def migrate_source_item_if_needed(table: object, item: dict) -> dict:
         existing_secret_ref=config.get("secret_ref"),
     )
     public_config["secret_ref"] = secret_ref
-
     now = datetime.now(timezone.utc).isoformat()
-    table.update_item(
-        Key={"source_id": source_id},
-        UpdateExpression="SET config = :cfg, updated_at = :u",
-        ExpressionAttributeValues={":cfg": public_config, ":u": now},
-    )
+
+    if table is not None and hasattr(table, "update_item"):
+        table.update_item(
+            Key={"source_id": source_id},
+            UpdateExpression="SET config = :cfg, updated_at = :u",
+            ExpressionAttributeValues={":cfg": public_config, ":u": now},
+        )
+    else:
+        from src.common.backends.factory import get_source_repo
+        get_source_repo().update(
+            source_id,
+            {"config": public_config, "updated_at": now},
+        )
 
     migrated = dict(item)
     migrated["config"] = public_config
