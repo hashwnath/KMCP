@@ -10,13 +10,7 @@
 
 </div>
 
-<div align="center">
-  <a href="https://github.com/hashwnath/KMCP/releases/download/v0.1.0/knowledgemcp-86s-1080p.mp4">
-    <img src="docs/assets/demo-thumbnail.png" alt="Watch the demo" width="640">
-  </a>
-  <br>
-  <sub>Click to watch the 86-second demo</sub>
-</div>
+<!-- DRAG-DROP YOUR DEMO VIDEO HERE (replace this comment) -->
 
 ---
 
