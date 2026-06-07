@@ -54,7 +54,7 @@ def _index_body(dim: int) -> dict[str, Any]:
                     "dimension": dim,
                     "method": {
                         "name": "hnsw",
-                        "engine": "lucene",
+                        "engine": "nmslib",
                         "space_type": "cosinesimil",
                     },
                 },
@@ -215,26 +215,34 @@ async def hybrid_search(
         logger.warning("Index %s does not exist", name)
         return []
 
-    must_clauses: list[dict] = [
-        {"multi_match": {"query": query, "fields": ["content", "title", "section"]}},
+    # OpenSearch 2.x hybrid: combine BM25 (multi_match) + native kNN in a
+    # bool/should so scores add. Avoids the dimension-fragile cosineSimilarity
+    # painless script.
+    should_clauses: list[dict] = [
+        {
+            "multi_match": {
+                "query": query,
+                "fields": ["content", "title", "section"],
+                "boost": _BM25_WEIGHT,
+            }
+        },
+        {
+            "knn": {
+                "embedding": {
+                    "vector": query_embedding,
+                    "k": top_k,
+                    "boost": _VECTOR_WEIGHT,
+                }
+            }
+        },
     ]
+    bool_query: dict[str, Any] = {"should": should_clauses}
     if code_only:
-        must_clauses.append({"term": {"is_code": True}})
+        bool_query["filter"] = [{"term": {"is_code": True}}]
 
     body: dict[str, Any] = {
         "size": top_k,
-        "query": {
-            "script_score": {
-                "query": {"bool": {"must": must_clauses}},
-                "script": {
-                    "source": (
-                        f"_score * {_BM25_WEIGHT} + "
-                        f"{_VECTOR_WEIGHT} * cosineSimilarity(params.query_vector, 'embedding') + 1.0"
-                    ),
-                    "params": {"query_vector": query_embedding},
-                },
-            },
-        },
+        "query": {"bool": bool_query},
     }
     response = await asyncio.to_thread(client.search, index=name, body=body)
     hits = response.get("hits", {}).get("hits", [])
