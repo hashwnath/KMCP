@@ -20,7 +20,7 @@ def test_validate_source_config_rejects_unknown_wiki_platform():
     assert err is not None
 
 
-def test_magic_link_returns_503_when_ses_not_configured(monkeypatch):
+def test_magic_link_returns_503_when_ses_not_configured_in_aws_mode(monkeypatch):
     app = Starlette(routes=[Route("/magic", request_magic_link, methods=["POST"])])
 
     monkeypatch.setattr(
@@ -29,7 +29,11 @@ def test_magic_link_returns_503_when_ses_not_configured(monkeypatch):
     )
     monkeypatch.setattr(
         "src.admin.routes.get_config",
-        lambda: SimpleNamespace(ses_from_email="", app_base_url="https://app.example"),
+        lambda: SimpleNamespace(
+            backend="aws",
+            ses_from_email="",
+            app_base_url="https://app.example",
+        ),
     )
 
     client = TestClient(app)
@@ -41,7 +45,7 @@ def test_magic_link_returns_503_when_ses_not_configured(monkeypatch):
 
 def test_magic_link_sends_email_and_hides_token(monkeypatch):
     app = Starlette(routes=[Route("/magic", request_magic_link, methods=["POST"])])
-    ses = MagicMock()
+    sender = MagicMock()
 
     monkeypatch.setattr(
         "src.admin.routes._find_tenant_by_email",
@@ -50,15 +54,44 @@ def test_magic_link_sends_email_and_hides_token(monkeypatch):
     monkeypatch.setattr(
         "src.admin.routes.get_config",
         lambda: SimpleNamespace(
+            backend="aws",
             ses_from_email="noreply@example.com",
             app_base_url="https://app.example",
         ),
     )
-    monkeypatch.setattr("src.admin.routes.get_ses_client", lambda: ses)
+    monkeypatch.setattr("src.admin.routes.get_email_sender", lambda: sender)
 
     client = TestClient(app)
     resp = client.post("/magic", json={"email": "user@example.com"})
 
     assert resp.status_code == 200
     assert resp.json() == {"sent": True}
-    assert ses.send_email.call_count == 1
+    assert sender.send.call_count == 1
+    # token must NOT appear in the response body
+    assert "token" not in resp.json()
+
+
+def test_magic_link_works_in_local_mode_without_ses_email(monkeypatch):
+    app = Starlette(routes=[Route("/magic", request_magic_link, methods=["POST"])])
+    sender = MagicMock()
+
+    monkeypatch.setattr(
+        "src.admin.routes._find_tenant_by_email",
+        lambda email: {"tenant_id": "t1", "email": email},
+    )
+    monkeypatch.setattr(
+        "src.admin.routes.get_config",
+        lambda: SimpleNamespace(
+            backend="local",
+            ses_from_email="",
+            app_base_url="http://localhost:3000",
+        ),
+    )
+    monkeypatch.setattr("src.admin.routes.get_email_sender", lambda: sender)
+
+    client = TestClient(app)
+    resp = client.post("/magic", json={"email": "user@example.com"})
+
+    assert resp.status_code == 200
+    assert resp.json() == {"sent": True}
+    sender.send.assert_called_once()

@@ -1,19 +1,19 @@
 """Global pytest fixtures for KnowledgeMCP tests."""
 
 import os
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from src.common.models import (
-    Tenant, Source, Document, Chunk, SourceType, IndexingStatus,
+    Chunk, Document, IndexingStatus, Source, SourceType, Tenant,
 )
 
 
 @pytest.fixture(autouse=True)
 def setup_env():
     os.environ.update({
+        "BACKEND": "aws",
         "AWS_REGION": "us-east-1",
         "AWS_ACCOUNT_ID": "123456789012",
         "JWT_SECRET_KEY": "test-secret-key",
@@ -23,15 +23,18 @@ def setup_env():
         "SOURCES_TABLE": "test-sources",
         "ANALYTICS_TABLE": "test-analytics",
         "CONTENT_BUCKET": "test-content",
-        "CRAWL_QUEUE_URL": "",
-        "INDEX_QUEUE_URL": "",
+        "CRAWL_QUEUE_URL": "https://sqs.example/crawl",
+        "INDEX_QUEUE_URL": "https://sqs.example/index",
     })
-    # Clear cached Settings so tests pick up the env vars set above.
+    # Clear cached Settings + backend factories so each test re-reads env.
     from src.common.config import get_config
     get_config.cache_clear()
     import src.common.config as _cfg_mod
     _cfg_mod.settings = get_config()
+    from src.common.backends.factory import reset_backend_factories
+    reset_backend_factories()
     yield
+    reset_backend_factories()
 
 
 @pytest.fixture
@@ -82,3 +85,46 @@ def test_html():
 @pytest.fixture
 def test_markdown_with_code():
     return """# Tutorial\n\nHere's code:\n\n```python\ndef hello():\n    print("hi")\n```\n\nAnd JS:\n\n```javascript\nconsole.log("hi");\n```\n"""
+
+
+@pytest.fixture
+def fake_tenant_repo(monkeypatch):
+    """Drop-in mock for the TenantRepository used by admin/routes and middleware."""
+    repo = MagicMock()
+    monkeypatch.setattr("src.common.backends.factory.get_tenant_repo", lambda: repo)
+    return repo
+
+
+@pytest.fixture
+def fake_source_repo(monkeypatch):
+    repo = MagicMock()
+    monkeypatch.setattr("src.common.backends.factory.get_source_repo", lambda: repo)
+    return repo
+
+
+@pytest.fixture
+def fake_queue(monkeypatch):
+    q = MagicMock()
+    monkeypatch.setattr("src.common.backends.factory.get_queue", lambda: q)
+    return q
+
+
+@pytest.fixture
+def fake_email_sender(monkeypatch):
+    sender = MagicMock()
+    monkeypatch.setattr("src.common.backends.factory.get_email_sender", lambda: sender)
+    return sender
+
+
+@pytest.fixture
+def fake_secret_store(monkeypatch):
+    store = MagicMock()
+    monkeypatch.setattr("src.common.backends.factory.get_secret_store", lambda: store)
+    return store
+
+
+@pytest.fixture
+def fake_analytics_repo(monkeypatch):
+    repo = MagicMock()
+    monkeypatch.setattr("src.common.backends.factory.get_analytics_repo", lambda: repo)
+    return repo
