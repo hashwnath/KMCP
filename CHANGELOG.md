@@ -45,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with the OpenSearch 2.x OSS Docker image used in compose / CI
 
 ### Security
-- Deleted orphan branch `claude/deploy-knowledgemcp-aws-S6pu5` from origin
+- Deleted orphan branch `(removed orphan branch)` from origin
   (7 historical secret leaks in HANDOFF docs that were never on `main`).
   See `SECURITY.md` for full disclosure.
 
