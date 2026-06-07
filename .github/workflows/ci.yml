@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    name: pytest (BACKEND=aws via mocks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install "bcrypt<4.0"
+
+      - name: Lint check (compile only)
+        run: |
+          python -m compileall src tests
+
+      - name: Run tests
+        env:
+          JWT_SECRET_KEY: ci-test-secret-key-do-not-use-anywhere-real
+          BACKEND: aws
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+  gitleaks:
+    name: gitleaks (no secrets in tree)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.18.4/gitleaks_8.18.4_linux_x64.tar.gz | sudo tar -xz -C /usr/local/bin gitleaks
+      - name: Scan working tree
+        run: gitleaks detect --no-banner --redact --no-git --source .
