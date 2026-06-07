@@ -16,10 +16,12 @@ from src.admin.auth import (
     hash_password,
     verify_password,
 )
-from src.common.aws_clients import (
-    get_dynamodb_resource,
-    get_ses_client,
-    get_sqs_client,
+from src.common.backends.factory import (
+    get_email_sender,
+    get_queue,
+    get_source_repo,
+    get_storage,
+    get_tenant_repo,
 )
 from src.common.config import get_config
 from src.common.source_secrets import (
@@ -33,7 +35,10 @@ from src.common.source_secrets import (
 
 _SYNC_SCHEDULES = {"manual", "hourly", "daily", "weekly"}
 _MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
-_ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".pptx", ".md", ".markdown", ".html", ".htm", ".txt"}
+_ALLOWED_UPLOAD_EXTENSIONS = {
+    ".pdf", ".docx", ".pptx", ".md", ".markdown", ".html", ".htm", ".txt",
+}
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -63,16 +68,7 @@ def _not_found(msg: str = "Not found") -> JSONResponse:
 
 def _find_tenant_by_email(email: str) -> dict | None:
     """Find first tenant row by email."""
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.tenants_table)
-    scan = table.scan(
-        FilterExpression="email = :e",
-        ExpressionAttributeValues={":e": email},
-        Limit=1,
-    )
-    items = scan.get("Items", [])
-    return items[0] if items else None
+    return get_tenant_repo().get_by_email(email)
 
 
 def _validate_source_config(source_type: str, source_config: dict) -> str | None:
@@ -99,22 +95,19 @@ def _redact_source_item(item: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 async def signup(request: Request) -> JSONResponse:
-    """POST /api/auth/signup — Create a new tenant account.
-
-    When SIGNUP_CODE is configured, the request must include a matching
-    ``invite_code`` field to proceed (invite-only beta access).
-    """
+    """POST /api/auth/signup — Create a new tenant account."""
     try:
         body = await request.json()
     except json.JSONDecodeError:
         return _bad_request("Invalid JSON body")
 
-    # Invite code gate (controlled beta)
     config = get_config()
     if config.signup_code:
         invite_code = (body.get("invite_code") or "").strip()
         if invite_code != config.signup_code:
-            return JSONResponse({"error": "Invalid or missing invite code"}, status_code=403)
+            return JSONResponse(
+                {"error": "Invalid or missing invite code"}, status_code=403
+            )
 
     email: str | None = body.get("email")
     password: str | None = body.get("password")
@@ -123,23 +116,14 @@ async def signup(request: Request) -> JSONResponse:
     if not email or not password or not name:
         return _bad_request("email, password, and name are required")
 
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.tenants_table)
-
-    # Check for existing tenant with same email
-    scan = table.scan(
-        FilterExpression="email = :e",
-        ExpressionAttributeValues={":e": email},
-        Limit=1,
-    )
-    if scan.get("Items"):
+    tenants = get_tenant_repo()
+    if tenants.get_by_email(email):
         return JSONResponse({"error": "Email already registered"}, status_code=409)
 
     tenant_id = str(uuid.uuid4())
     api_key = generate_api_key()
 
-    table.put_item(Item={
+    tenants.put({
         "tenant_id": tenant_id,
         "email": email,
         "password_hash": hash_password(password),
@@ -147,16 +131,15 @@ async def signup(request: Request) -> JSONResponse:
         "api_key": api_key,
         "slug": name.lower().replace(" ", "-"),
         "rate_limit": 100,
-        "require_api_key": False,  # MCP endpoint is public by default
+        "require_api_key": False,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
 
     token = create_access_token({"tenant_id": tenant_id, "email": email})
-    return JSONResponse({
-        "token": token,
-        "tenant_id": tenant_id,
-        "api_key": api_key,
-    }, status_code=201)
+    return JSONResponse(
+        {"token": token, "tenant_id": tenant_id, "api_key": api_key},
+        status_code=201,
+    )
 
 
 async def login(request: Request) -> JSONResponse:
@@ -172,20 +155,10 @@ async def login(request: Request) -> JSONResponse:
     if not email or not password:
         return _bad_request("email and password are required")
 
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.tenants_table)
-
-    scan = table.scan(
-        FilterExpression="email = :e",
-        ExpressionAttributeValues={":e": email},
-        Limit=1,
-    )
-    items = scan.get("Items", [])
-    if not items:
+    tenant = get_tenant_repo().get_by_email(email)
+    if not tenant:
         return _unauthorized()
 
-    tenant = items[0]
     if not verify_password(password, tenant["password_hash"]):
         return _unauthorized()
 
@@ -197,10 +170,7 @@ async def login(request: Request) -> JSONResponse:
 
 
 async def request_magic_link(request: Request) -> JSONResponse:
-    """POST /api/auth/magic-link/request — Create a short-lived login token.
-
-    Sends the link via SES and never returns raw token material.
-    """
+    """POST /api/auth/magic-link/request — Create a short-lived login token."""
     try:
         body = await request.json()
     except json.JSONDecodeError:
@@ -211,8 +181,12 @@ async def request_magic_link(request: Request) -> JSONResponse:
         return _bad_request("email is required")
 
     cfg = get_config()
-    if not cfg.ses_from_email:
-        return JSONResponse({"error": "Magic link delivery is not configured"}, status_code=503)
+    # In AWS mode, require SES_FROM_EMAIL. In local mode the LogEmailSender
+    # works without any config — it just prints the link to stdout.
+    if cfg.backend == "aws" and not cfg.ses_from_email:
+        return JSONResponse(
+            {"error": "Magic link delivery is not configured"}, status_code=503
+        )
 
     tenant = _find_tenant_by_email(email)
     if not tenant:
@@ -228,22 +202,15 @@ async def request_magic_link(request: Request) -> JSONResponse:
         expires_delta=timedelta(minutes=15),
     )
     link = f"{cfg.app_base_url.rstrip('/')}/login?magic_token={token}"
-    ses = get_ses_client()
-    ses.send_email(
-        Source=cfg.ses_from_email,
-        Destination={"ToAddresses": [tenant["email"]]},
-        Message={
-            "Subject": {"Data": "Your KnowledgeMCP sign-in link"},
-            "Body": {
-                "Text": {
-                    "Data": (
-                        "Use this sign-in link (valid for 15 minutes):\n\n"
-                        f"{link}\n\n"
-                        "If you did not request this email, you can ignore it."
-                    )
-                }
-            },
-        },
+    get_email_sender().send(
+        to_address=tenant["email"],
+        subject="Your KnowledgeMCP sign-in link",
+        body_text=(
+            "Use this sign-in link (valid for 15 minutes):\n\n"
+            f"{link}\n\n"
+            "If you did not request this email, you can ignore it."
+        ),
+        from_address=cfg.ses_from_email,
     )
     return JSONResponse({"sent": True})
 
@@ -276,15 +243,11 @@ async def get_me(request: Request) -> JSONResponse:
     if not tenant_id:
         return _unauthorized()
 
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.tenants_table)
-
-    resp = table.get_item(Key={"tenant_id": tenant_id})
-    tenant = resp.get("Item")
+    tenant = get_tenant_repo().get_by_id(tenant_id)
     if not tenant:
         return _not_found("Tenant not found")
 
+    tenant = dict(tenant)
     tenant.pop("password_hash", None)
     return JSONResponse(tenant)
 
@@ -312,15 +275,13 @@ async def create_source(request: Request) -> JSONResponse:
     if not source_type or not name or not source_config:
         return _bad_request("source_type, name, and config are required")
     if sync_schedule not in _SYNC_SCHEDULES:
-        return _bad_request("sync_schedule must be one of: manual, hourly, daily, weekly")
+        return _bad_request(
+            "sync_schedule must be one of: manual, hourly, daily, weekly"
+        )
 
     cfg_error = _validate_source_config(source_type, source_config)
     if cfg_error:
         return _bad_request(cfg_error)
-
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.sources_table)
 
     source_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -341,19 +302,17 @@ async def create_source(request: Request) -> JSONResponse:
         "created_at": now,
         "updated_at": now,
     }
-    table.put_item(Item=item)
+    get_source_repo().put(item)
 
-    # Enqueue crawl job
-    sqs = get_sqs_client()
-    sqs.send_message(
-        QueueUrl=config.crawl_queue_url,
-        MessageBody=json.dumps({
+    get_queue().send(
+        "crawl",
+        {
             "tenant_id": tenant_id,
             "source_id": source_id,
             "source_type": source_type,
             "config": public_config,
             "action": "crawl",
-        }),
+        },
     )
 
     return JSONResponse(_redact_source_item(item), status_code=201)
@@ -365,18 +324,10 @@ async def list_sources(request: Request) -> JSONResponse:
     if not tenant_id:
         return _unauthorized()
 
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.sources_table)
-
-    resp = table.query(
-        IndexName="tenant-index",
-        KeyConditionExpression="tenant_id = :tid",
-        ExpressionAttributeValues={":tid": tenant_id},
-    )
+    repo = get_source_repo()
     items = []
-    for item in resp.get("Items", []):
-        migrated = _migrate_source_item_if_needed(table, item)
+    for item in repo.list_by_tenant(tenant_id):
+        migrated = _migrate_source_item_if_needed(None, item)
         items.append(_redact_source_item(migrated))
     return JSONResponse({"sources": items})
 
@@ -388,16 +339,11 @@ async def get_source(request: Request) -> JSONResponse:
         return _unauthorized()
 
     source_id = request.path_params["source_id"]
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.sources_table)
-
-    resp = table.get_item(Key={"source_id": source_id})
-    item = resp.get("Item")
+    item = get_source_repo().get_by_id(source_id)
     if not item or item.get("tenant_id") != tenant_id:
         return _not_found("Source not found")
 
-    item = _migrate_source_item_if_needed(table, item)
+    item = _migrate_source_item_if_needed(None, item)
     return JSONResponse(_redact_source_item(item))
 
 
@@ -408,37 +354,30 @@ async def reindex_source(request: Request) -> JSONResponse:
         return _unauthorized()
 
     source_id = request.path_params["source_id"]
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.sources_table)
-
-    resp = table.get_item(Key={"source_id": source_id})
-    item = resp.get("Item")
+    repo = get_source_repo()
+    item = repo.get_by_id(source_id)
     if not item or item.get("tenant_id") != tenant_id:
         return _not_found("Source not found")
 
-    item = _migrate_source_item_if_needed(table, item)
+    item = _migrate_source_item_if_needed(None, item)
 
-    table.update_item(
-        Key={"source_id": source_id},
-        UpdateExpression="SET #s = :s, updated_at = :u",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={
-            ":s": "reindexing",
-            ":u": datetime.now(timezone.utc).isoformat(),
+    repo.update(
+        source_id,
+        {
+            "status": "reindexing",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         },
     )
 
-    sqs = get_sqs_client()
-    sqs.send_message(
-        QueueUrl=config.crawl_queue_url,
-        MessageBody=json.dumps({
+    get_queue().send(
+        "crawl",
+        {
             "tenant_id": tenant_id,
             "source_id": source_id,
             "source_type": item["source_type"],
             "config": item["config"],
             "action": "reindex",
-        }),
+        },
     )
 
     return JSONResponse({"status": "reindexing", "source_id": source_id})
@@ -458,20 +397,20 @@ async def update_source_schedule(request: Request) -> JSONResponse:
 
     sync_schedule = body.get("sync_schedule")
     if sync_schedule not in _SYNC_SCHEDULES:
-        return _bad_request("sync_schedule must be one of: manual, hourly, daily, weekly")
+        return _bad_request(
+            "sync_schedule must be one of: manual, hourly, daily, weekly"
+        )
 
-    config = get_config()
-    table = get_dynamodb_resource().Table(config.sources_table)
-    item = table.get_item(Key={"source_id": source_id}).get("Item")
+    repo = get_source_repo()
+    item = repo.get_by_id(source_id)
     if not item or item.get("tenant_id") != tenant_id:
         return _not_found("Source not found")
 
-    table.update_item(
-        Key={"source_id": source_id},
-        UpdateExpression="SET sync_schedule = :sc, updated_at = :u",
-        ExpressionAttributeValues={
-            ":sc": sync_schedule,
-            ":u": datetime.now(timezone.utc).isoformat(),
+    repo.update(
+        source_id,
+        {
+            "sync_schedule": sync_schedule,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         },
     )
     return JSONResponse({"updated": True, "sync_schedule": sync_schedule})
@@ -484,12 +423,8 @@ async def delete_source(request: Request) -> JSONResponse:
         return _unauthorized()
 
     source_id = request.path_params["source_id"]
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.sources_table)
-
-    resp = table.get_item(Key={"source_id": source_id})
-    item = resp.get("Item")
+    repo = get_source_repo()
+    item = repo.get_by_id(source_id)
     if not item or item.get("tenant_id") != tenant_id:
         return _not_found("Source not found")
 
@@ -497,17 +432,15 @@ async def delete_source(request: Request) -> JSONResponse:
     if secret_ref:
         _delete_source_secret(secret_ref)
 
-    table.delete_item(Key={"source_id": source_id})
+    repo.delete(source_id)
 
-    # Enqueue cleanup job to remove indexed content
-    sqs = get_sqs_client()
-    sqs.send_message(
-        QueueUrl=config.crawl_queue_url,
-        MessageBody=json.dumps({
+    get_queue().send(
+        "crawl",
+        {
             "tenant_id": tenant_id,
             "source_id": source_id,
             "action": "delete",
-        }),
+        },
     )
 
     return JSONResponse({"deleted": True, "source_id": source_id})
@@ -518,50 +451,38 @@ async def delete_source(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def analytics_overview(request: Request) -> JSONResponse:
-    """GET /api/analytics/overview — Usage summary stats."""
     tenant_id = _get_tenant_id(request)
     if not tenant_id:
         return _unauthorized()
-
     from src.analytics.reporter import get_overview
-
     return JSONResponse(get_overview(tenant_id))
 
 
 async def analytics_gaps(request: Request) -> JSONResponse:
-    """GET /api/analytics/gaps — Content gap queries."""
     tenant_id = _get_tenant_id(request)
     if not tenant_id:
         return _unauthorized()
-
     from src.analytics.reporter import get_content_gaps
-
     days = int(request.query_params.get("days", "7"))
     limit = int(request.query_params.get("limit", "20"))
     return JSONResponse({"gaps": get_content_gaps(tenant_id, days=days, limit=limit)})
 
 
 async def analytics_top_queries(request: Request) -> JSONResponse:
-    """GET /api/analytics/top-queries — Highest volume queries."""
     tenant_id = _get_tenant_id(request)
     if not tenant_id:
         return _unauthorized()
-
     from src.analytics.reporter import get_top_queries
-
     days = int(request.query_params.get("days", "7"))
     limit = int(request.query_params.get("limit", "20"))
     return JSONResponse({"queries": get_top_queries(tenant_id, days=days, limit=limit)})
 
 
 async def analytics_tool_usage(request: Request) -> JSONResponse:
-    """GET /api/analytics/tool-usage — Breakdown by tool name."""
     tenant_id = _get_tenant_id(request)
     if not tenant_id:
         return _unauthorized()
-
     from src.analytics.reporter import get_tool_usage_breakdown
-
     days = int(request.query_params.get("days", "7"))
     return JSONResponse({"usage": get_tool_usage_breakdown(tenant_id, days=days)})
 
@@ -571,20 +492,12 @@ async def analytics_tool_usage(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 async def get_settings(request: Request) -> JSONResponse:
-    """GET /api/settings — Return current tenant settings."""
     tenant_id = _get_tenant_id(request)
     if not tenant_id:
         return _unauthorized()
-
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.tenants_table)
-
-    resp = table.get_item(Key={"tenant_id": tenant_id})
-    tenant = resp.get("Item")
+    tenant = get_tenant_repo().get_by_id(tenant_id)
     if not tenant:
         return _not_found("Tenant not found")
-
     return JSONResponse({
         "slug": tenant.get("slug"),
         "rate_limit": tenant.get("rate_limit", 100),
@@ -595,7 +508,6 @@ async def get_settings(request: Request) -> JSONResponse:
 
 
 async def update_settings(request: Request) -> JSONResponse:
-    """PUT /api/settings — Update tenant settings (slug, rate_limit)."""
     tenant_id = _get_tenant_id(request)
     if not tenant_id:
         return _unauthorized()
@@ -605,72 +517,39 @@ async def update_settings(request: Request) -> JSONResponse:
     except json.JSONDecodeError:
         return _bad_request("Invalid JSON body")
 
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.tenants_table)
-
-    update_parts: list[str] = []
-    attr_values: dict = {}
-    attr_names: dict = {}
-
+    updates: dict = {}
     if "slug" in body:
-        update_parts.append("#sl = :sl")
-        attr_names["#sl"] = "slug"
-        attr_values[":sl"] = body["slug"]
-
+        updates["slug"] = body["slug"]
     if "rate_limit" in body:
-        update_parts.append("rate_limit = :rl")
-        attr_values[":rl"] = int(body["rate_limit"])
-
+        updates["rate_limit"] = int(body["rate_limit"])
     if "max_docs" in body:
-        update_parts.append("max_docs = :md")
-        attr_values[":md"] = int(body["max_docs"])
-
+        updates["max_docs"] = int(body["max_docs"])
     if "require_api_key" in body:
-        update_parts.append("require_api_key = :rak")
-        attr_values[":rak"] = bool(body["require_api_key"])
+        updates["require_api_key"] = bool(body["require_api_key"])
 
-    if not update_parts:
+    if not updates:
         return _bad_request("No valid fields to update")
 
-    table.update_item(
-        Key={"tenant_id": tenant_id},
-        UpdateExpression="SET " + ", ".join(update_parts),
-        ExpressionAttributeValues=attr_values,
-        **({"ExpressionAttributeNames": attr_names} if attr_names else {}),
-    )
+    get_tenant_repo().update(tenant_id, updates)
     return JSONResponse({"updated": True})
 
 
 async def regenerate_key(request: Request) -> JSONResponse:
-    """POST /api/settings/regenerate-key — Generate a new API key for the tenant."""
     tenant_id = _get_tenant_id(request)
     if not tenant_id:
         return _unauthorized()
 
     new_key = generate_api_key()
-    config = get_config()
-    dynamo = get_dynamodb_resource()
-    table = dynamo.Table(config.tenants_table)
-
-    table.update_item(
-        Key={"tenant_id": tenant_id},
-        UpdateExpression="SET api_key = :k",
-        ExpressionAttributeValues={":k": new_key},
-    )
+    get_tenant_repo().update(tenant_id, {"api_key": new_key})
     return JSONResponse({"api_key": new_key})
 
 
 # ---------------------------------------------------------------------------
-# File upload (presigned URL)
+# File upload (presigned URL — AWS) / direct upload (local)
 # ---------------------------------------------------------------------------
 
 async def upload_presign(request: Request) -> JSONResponse:
-    """POST /api/upload/presign — Generate a presigned S3 PUT URL for file upload.
-
-    Body: {"filename": "guide.pdf", "content_type": "application/pdf"}
-    Returns: {"upload_url": "https://s3...", "key": "uploads/tenant-id/uuid/guide.pdf"}
-    """
+    """POST /api/upload/presign — Generate a presigned PUT URL for file upload."""
     tenant_id = _get_tenant_id(request)
     if not tenant_id:
         return _unauthorized()
@@ -689,7 +568,9 @@ async def upload_presign(request: Request) -> JSONResponse:
     dot = lower.rfind(".")
     ext = lower[dot:] if dot != -1 else ""
     if ext not in _ALLOWED_UPLOAD_EXTENSIONS:
-        return _bad_request("Unsupported file type. Allowed: PDF, DOCX, PPTX, MD, HTML, TXT")
+        return _bad_request(
+            "Unsupported file type. Allowed: PDF, DOCX, PPTX, MD, HTML, TXT"
+        )
     if file_size_bytes <= 0:
         return _bad_request("file_size_bytes is required")
     if file_size_bytes > _MAX_UPLOAD_BYTES:
@@ -700,20 +581,50 @@ async def upload_presign(request: Request) -> JSONResponse:
     import uuid as _uuid
     key = f"uploads/{tenant_id}/{_uuid.uuid4()}/{filename}"
 
-    config = get_config()
-    from src.common.aws_clients import get_s3_client
-    s3 = get_s3_client()
-    upload_url = s3.generate_presigned_url(
-        ClientMethod="put_object",
-        Params={
-            "Bucket": config.content_bucket,
-            "Key": key,
-            "ContentType": content_type,
-        },
-        ExpiresIn=3600,
+    upload_url = get_storage().presigned_upload_url(
+        key=key, content_type=content_type, expires_in_seconds=3600
     )
+    return JSONResponse({
+        "upload_url": upload_url,
+        "key": key,
+        "bucket": get_config().content_bucket,
+    })
 
-    return JSONResponse({"upload_url": upload_url, "key": key, "bucket": config.content_bucket})
+
+async def upload_direct(request: Request) -> JSONResponse:
+    """POST /api/upload/direct — Direct multipart upload for local mode.
+
+    Body is multipart/form-data with `file` field. Returns the storage key
+    that can be passed back as `config.key` to /api/sources.
+    """
+    tenant_id = _get_tenant_id(request)
+    if not tenant_id:
+        return _unauthorized()
+
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        return _bad_request("'file' field is required (multipart/form-data)")
+
+    filename = getattr(upload, "filename", "file") or "file"
+    lower = filename.lower()
+    dot = lower.rfind(".")
+    ext = lower[dot:] if dot != -1 else ""
+    if ext not in _ALLOWED_UPLOAD_EXTENSIONS:
+        return _bad_request(
+            "Unsupported file type. Allowed: PDF, DOCX, PPTX, MD, HTML, TXT"
+        )
+
+    data = await upload.read()
+    if len(data) > _MAX_UPLOAD_BYTES:
+        return _bad_request("File exceeds maximum allowed size of 500MB")
+
+    import uuid as _uuid
+    key = f"uploads/{tenant_id}/{_uuid.uuid4()}/{filename}"
+    content_type = getattr(upload, "content_type", None) or "application/octet-stream"
+    get_storage().put(key, data, content_type)
+
+    return JSONResponse({"key": key, "size_bytes": len(data)})
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +647,7 @@ routes = [
     Route("/api/sources/{source_id}", delete_source, methods=["DELETE"]),
     # Upload
     Route("/api/upload/presign", upload_presign, methods=["POST"]),
+    Route("/api/upload/direct", upload_direct, methods=["POST"]),
     # Analytics
     Route("/api/analytics/overview", analytics_overview, methods=["GET"]),
     Route("/api/analytics/gaps", analytics_gaps, methods=["GET"]),
