@@ -1,11 +1,11 @@
 'use client';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { login, requestMagicLink, verifyMagicLink } from '@/lib/api';
 import { setToken } from '@/lib/auth';
 
-export default function LoginPage() {
+function LoginInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [email, setEmail] = useState(''); const [password, setPassword] = useState('');
@@ -90,5 +90,14 @@ export default function LoginPage() {
         <p className="text-center mt-6" style={{ color: 'var(--muted)' }}>No account? <Link href="/signup" style={{ color: 'var(--primary)' }} className="font-semibold hover:underline">Create one</Link></p>
       </div>
     </main>
+  );
+}
+
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<main className="min-h-screen flex items-center justify-center"><p>Loading…</p></main>}>
+      <LoginInner />
+    </Suspense>
   );
 }

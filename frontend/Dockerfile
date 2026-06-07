@@ -8,9 +8,9 @@ FROM node:20-alpine AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
-# Build-time env (compile-time): can be overridden at build time.
-# At runtime, all /api calls go through Next.js rewrites so the user does
-# not need to know the backend URL at build time.
+# Ensure public/ always exists so the runner COPY doesn't fail when the
+# project hasn't added any static assets yet.
+RUN mkdir -p public
 ARG NEXT_PUBLIC_API_URL=
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 RUN npm run build
@@ -20,7 +20,7 @@ WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000
 RUN addgroup -S nextjs && adduser -S nextjs -G nextjs
-COPY --from=build /app/public ./public 2>/dev/null || true
+COPY --from=build /app/public ./public
 COPY --from=build /app/.next ./.next
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
