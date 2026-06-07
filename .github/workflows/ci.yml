@@ -7,34 +7,105 @@ on:
     branches: [main]
 
 jobs:
-  pytest:
-    name: pytest (BACKEND=aws via mocks)
+  pytest-aws-mock:
+    name: pytest (BACKEND=aws mocked)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
           pip install "bcrypt<4.0"
-
-      - name: Lint check (compile only)
-        run: |
-          python -m compileall src tests
-
+      - name: Compile check
+        run: python -m compileall src tests
       - name: Run tests
         env:
-          JWT_SECRET_KEY: ci-test-secret-key-do-not-use-anywhere-real
+          JWT_SECRET_KEY: ci-test-secret
           BACKEND: aws
+        run: python -m pytest tests/ -v --tb=short
+
+  pytest-local:
+    name: pytest (BACKEND=local + SQLite + fastembed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Cache fastembed model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-${{ runner.os }}-bge-small-v1.5
+      - name: Install dependencies
         run: |
-          python -m pytest tests/ -v --tb=short
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,local]"
+          pip install "bcrypt<4.0"
+      - name: Run tests
+        env:
+          JWT_SECRET_KEY: ci-test-secret
+          BACKEND: local
+          EMBEDDING_PROVIDER: local
+          LOCAL_DATA_DIR: /tmp/kmcp-ci-data
+        run: python -m pytest tests/ -v --tb=short
+
+  pytest-opensearch:
+    name: pytest (local + OpenSearch service container)
+    runs-on: ubuntu-latest
+    services:
+      opensearch:
+        image: opensearchproject/opensearch:2.11.0
+        env:
+          discovery.type: single-node
+          DISABLE_SECURITY_PLUGIN: "true"
+          OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9200/_cluster/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Cache fastembed model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-${{ runner.os }}-bge-small-v1.5
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,local]"
+          pip install "bcrypt<4.0"
+      - name: Wait for OpenSearch
+        run: |
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:9200/_cluster/health >/dev/null 2>&1; then
+              echo "OpenSearch ready"; break
+            fi
+            sleep 3
+          done
+          curl -fsS http://localhost:9200/_cluster/health
+      - name: Run integration tests
+        env:
+          JWT_SECRET_KEY: ci-test-secret
+          BACKEND: local
+          EMBEDDING_PROVIDER: local
+          LOCAL_DATA_DIR: /tmp/kmcp-ci-data
+          OPENSEARCH_ENDPOINT: http://localhost:9200
+        run: python -m pytest tests/ -v --tb=short -k "test_local_e2e or test_local_backends"
 
   gitleaks:
     name: gitleaks (no secrets in tree)

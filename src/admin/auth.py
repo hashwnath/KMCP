@@ -27,10 +27,16 @@ def create_access_token(
     """Create a signed JWT access token with the given payload and expiry."""
     config = get_config()
     if not config.jwt_secret_key:
-        raise ValueError(
-            "JWT_SECRET_KEY environment variable is not set. "
-            "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(64))'"
-        )
+        # In local mode, auto-generate a secret on first use.
+        if config.backend == "local":
+            from src.common.backends.local.init_jwt import ensure_jwt_secret
+            ensure_jwt_secret()
+            config = get_config()
+        if not config.jwt_secret_key:
+            raise ValueError(
+                "JWT_SECRET_KEY environment variable is not set. "
+                "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(64))'"
+            )
     to_encode = data.copy()
     to_encode["exp"] = datetime.now(timezone.utc) + expires_delta
     return jwt.encode(to_encode, config.jwt_secret_key, algorithm="HS256")

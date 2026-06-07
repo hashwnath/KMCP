@@ -23,3 +23,6 @@ opensearch-py>=2.4.0
 uvicorn>=0.30.0
 starlette>=0.38.0
 mangum>=0.17.0
+
+# Local embeddings (zero-cost path)
+fastembed>=0.3.0
