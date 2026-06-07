@@ -1,24 +1,116 @@
-version: "3.8"
+# KnowledgeMCP — zero-cloud local stack
+#
+# `docker compose up -d` brings up:
+#   opensearch  (search index, port 9200)
+#   admin       (REST API for the dashboard, port 8081)
+#   mcp         (Model Context Protocol endpoint, port 8000)
+#   worker      (background job processor — crawls + indexes)
+#   frontend    (Next.js dashboard, port 3000)
+
 services:
-  mcp-server:
-    build: .
-    container_name: knowledgemcp-mcp
-    ports: ["8000:8000"]
-    env_file: .env
-    command: uvicorn src.mcp_server.handler:app --host 0.0.0.0 --port 8000 --reload
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: kmcp-opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 30
+      start_period: 30s
 
-  admin-api:
-    build: .
-    container_name: knowledgemcp-admin
-    ports: ["8081:8081"]
-    env_file: .env
-    command: uvicorn src.admin.handler:app --host 0.0.0.0 --port 8081 --reload
+  admin:
+    build:
+      context: .
+    container_name: kmcp-admin
+    command: >
+      uvicorn src.admin.handler:app
+      --host 0.0.0.0 --port 8081
+    environment:
+      BACKEND: local
+      LOCAL_DATA_DIR: /data
+      EMBEDDING_PROVIDER: local
+      OPENSEARCH_ENDPOINT: http://opensearch:9200
+      FRONTEND_ORIGIN: http://localhost:3000
+      APP_BASE_URL: http://localhost:3000
+      DEV_AUTH_ALLOW: "true"
+    ports:
+      - "8081:8081"
+    volumes:
+      - app-data:/data
+    depends_on:
+      opensearch: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/api/tenants/me -o /dev/null -w '%{http_code}' | grep -qE '401|200'"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
 
-networks:
-  default:
-    name: knowledgemcp
+  mcp:
+    build:
+      context: .
+    container_name: kmcp-mcp
+    command: >
+      uvicorn src.mcp_server.handler:app
+      --host 0.0.0.0 --port 8000
+    environment:
+      BACKEND: local
+      LOCAL_DATA_DIR: /data
+      EMBEDDING_PROVIDER: local
+      OPENSEARCH_ENDPOINT: http://opensearch:9200
+    ports:
+      - "8000:8000"
+    volumes:
+      - app-data:/data
+    depends_on:
+      opensearch: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  worker:
+    build:
+      context: .
+    container_name: kmcp-worker
+    command: ["python", "-m", "src.common.backends.local.worker"]
+    environment:
+      BACKEND: local
+      LOCAL_DATA_DIR: /data
+      EMBEDDING_PROVIDER: local
+      OPENSEARCH_ENDPOINT: http://opensearch:9200
+      LOG_LEVEL: INFO
+    volumes:
+      - app-data:/data
+    depends_on:
+      opensearch: { condition: service_healthy }
+      admin: { condition: service_started }
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: kmcp-frontend
+    environment:
+      ADMIN_API_URL: http://admin:8081
+    ports:
+      - "3000:3000"
+    depends_on:
+      admin: { condition: service_started }
+
+volumes:
+  opensearch-data:
+  app-data:
