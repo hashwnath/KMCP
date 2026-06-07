@@ -2,6 +2,19 @@
 .env
 .env.local
 .env.production
+.env.deploy
+.env.*.local
+*-credentials.json
+*-service-account.json
+
+# Local KnowledgeMCP data dir (SQLite, filesystem storage, model cache, jwt secret)
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+model_cache/
 
 # Python
 __pycache__/
@@ -16,6 +29,7 @@ venv/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+node_modules/
 
 # AWS SAM
 .aws-sam/
@@ -34,3 +48,16 @@ Thumbs.db
 .pytest_cache/
 htmlcov/
 .coverage
+coverage.xml
+
+# Build / packaging
+*.egg
+*.whl
+
+# Local handoff / transcript files (never commit)
+HANDOFF*.md
+*-session-transcript.md
+*_session_transcript.md
+.claude/
+.codespace-handoff/
+SECURITY_INCIDENT.md
