@@ -11,7 +11,7 @@ jobs:
     name: pytest (BACKEND=aws mocked)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -33,7 +33,7 @@ jobs:
     name: pytest (BACKEND=local + SQLite + fastembed)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -74,7 +74,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -111,7 +111,7 @@ jobs:
     name: sam validate (AWS template stays green)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: aws-actions/setup-sam@v2
         with:
           use-installer: true
@@ -124,7 +124,7 @@ jobs:
     name: docker compose build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build all images
         run: docker compose build
 
@@ -132,7 +132,7 @@ jobs:
     name: gitleaks (no secrets in tree)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - name: Install gitleaks
